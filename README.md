@@ -1,4 +1,3 @@
-# ESP32-Catbot-NEKO-Network-Embedded-Kitty-Object-
 # 🐱 N.E.K.O. (Network Embedded Kitty Object)
 
 > **"A Desktop Companion that lives in the Cloud."**
