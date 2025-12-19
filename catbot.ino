@@ -1,268 +1,293 @@
 /*
- * N.E.K.O. (Network Embedded Kitty Object)
- * Hardware: ESP32 + SSD1306 OLED + IR Sensor
- * Features: 
- * - IR Sensor (GPIO 19): Wave hand to switch Mode (Face/Clock)
- * - Safe WiFi Reset: Hold BOOT button during startup
- * - Animated Eyes & Internet Clock
+ * 🐱 N.E.K.O. - EASY ADMIN VERSION
+ * -------------------------------------------------------
+ * Cara Pakai:
+ * 1. Nyalakan alat seperti biasa (Mode Kucing/Jam).
+ * 2. Ingin Upload Gambar? TAHAN tombol BOOT (di board) selama 3 detik.
+ * 3. Alat akan berubah jadi Mode Admin (WiFi Hotspot).
+ * 4. Connect Laptop ke WiFi "Neko-Admin", buka 192.168.4.1
  */
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <WiFiManager.h> // Library: "WiFiManager" by tzapu
+#include <WiFiManager.h> 
 #include "time.h"
+#include <LittleFS.h>
+#include <WebServer.h>
 
-// --- PINS ---
-#define IR_SENSOR_PIN 19  // The new IR Sensor Pin
-#define BUTTON_PIN 0      // Built-in BOOT button (Used only for WiFi Reset now)
+// --- PIN ---
+#define IR_SENSOR_PIN 19  
+#define BUTTON_PIN 0      // Tombol BOOT
 
-// --- CONFIGURATION ---
-const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 25200; // GMT+7 (WIB)
-const int   daylightOffset_sec = 0;
-
-// --- SCREEN ---
+// --- LAYAR ---
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// --- LOGIC GLOBALS ---
-enum AppMode { MODE_CAT, MODE_CLOCK };
+// --- SERVER & VARS ---
+WebServer server(80);
+bool hasCustomFace = false;
+uint8_t customFaceBuffer[1024];
+
+// Status System
+bool isAdminMode = false;       // False = Mode Kucing, True = Mode Upload
+unsigned long buttonPressStart = 0; // Untuk hitung durasi tekan tombol
+
+// Vars Animasi
+enum AppMode { MODE_CAT, MODE_CLOCK, MODE_CUSTOM };
 AppMode currentMode = MODE_CAT; 
+int pupilOffset = 0; unsigned long lastBlinkTime = 0; int blinkInterval = 3000; 
+bool isBlinking = false; bool isWinking = false; int winkSide = 0;         
+int lastIrState = HIGH; unsigned long lastInputTime = 0;
 
-// Animation Vars
-int pupilOffset = 0;      
-unsigned long lastBlinkTime = 0;
-int blinkInterval = 3000; 
-bool isBlinking = false;
-bool isWinking = false;
-int winkSide = 0;         
+// Time
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 25200; 
+const int   daylightOffset_sec = 0;
 
-// Input Handling Vars
-int lastIrState = HIGH;        // Assume standard IR sensor (High = Clear, Low = Object)
-unsigned long lastInputTime = 0;
+// ==========================================
+// 1. FUNGSI ADMIN & FILE
+// ==========================================
 
-// --- WIFI CALLBACK ---
-void configModeCallback (WiFiManager *myWiFiManager) {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  
-  display.println("WiFi Not Found!");
-  display.println("----------------");
-  display.println("Starting Setup AP...");
-  display.println("");
-  display.print("Name: "); display.println("CatBot-AP"); 
-  display.println("(Use private pass)"); 
-  display.display();
-  
-  Serial.println("Entered config mode");
-  Serial.println(WiFi.softAPIP());
+void loadCustomFace() {
+  if (LittleFS.exists("/face.bin")) {
+    File file = LittleFS.open("/face.bin", "r");
+    if (file.size() == 1024) { 
+      file.read(customFaceBuffer, 1024);
+      hasCustomFace = true;
+    }
+    file.close();
+  } else { hasCustomFace = false; }
 }
+
+void enterAdminMode() {
+  isAdminMode = true;
+  
+  // Matikan WiFi Station & Nyalakan AP
+  WiFi.disconnect(); 
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("Neko-Admin", "12345678");
+
+  // --- HALAMAN UTAMA ---
+  server.on("/", HTTP_GET, [](){
+    String html = "<html><body style='background:#222;color:#0f0;text-align:center;font-family:monospace;'>";
+    html += "<h1>N.E.K.O ADMIN MODE</h1>";
+    html += "<div style='border:2px solid #0f0;padding:20px;'>";
+    html += "<h3>UPLOAD IMAGE (.bin)</h3>";
+    html += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
+    html += "<input type='file' name='upload' style='color:white;'><br><br>";
+    html += "<input type='submit' value='UPLOAD' style='background:#0f0;padding:10px;font-weight:bold;'>";
+    html += "</form></div>";
+    html += "<br><a href='/exit'><button style='padding:15px;background:red;color:white;'>KELUAR ADMIN MODE</button></a>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  // --- BAGIAN YANG DIPERBAIKI (FIX CORRUPTED ERROR) ---
+  server.on("/upload", HTTP_POST, 
+    // 1. Handler RESPON (Dijalankan SETELAH upload selesai)
+    [](){ 
+      server.send(200, "text/html", "<h2>UPLOAD SUKSES!</h2><p>Gambar tersimpan.</p><a href='/'>Kembali</a>"); 
+    }, 
+    // 2. Handler PROSES UPLOAD (Dijalankan SAAT data dikirim)
+    [](){
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        // Hapus file lama, buat baru
+        LittleFS.remove("/face.bin"); 
+        File file = LittleFS.open("/face.bin", "w");
+        file.close();
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        // Tulis data chunk demi chunk
+        File file = LittleFS.open("/face.bin", "a");
+        if (file) file.write(upload.buf, upload.currentSize);
+        file.close();
+      } else if (upload.status == UPLOAD_FILE_END) {
+        // Saat selesai, reload gambar ke RAM
+        loadCustomFace();
+        // PENTING: JANGAN ada server.send() di sini! Biarkan Handler 1 yang kerjakan.
+      }
+    }
+  );
+
+  server.on("/exit", HTTP_GET, [](){
+    // 1. Kirim pesan terakhir ke Browser
+    server.send(200, "text/html", "<h2 style='text-align:center;'>Restarting N.E.K.O...<br>Silakan tutup browser.</h2>");
+    delay(500);
+
+    // 2. Bersihkan Layar (Agar tidak terlihat stuck)
+    display.clearDisplay();
+    display.setCursor(0, 20);
+    display.println("REBOOTING...");
+    display.display();
+    delay(1000);
+
+    // 3. Matikan WiFi & Putus Koneksi Total (Penting!)
+    WiFi.disconnect(true);  // Hapus kredensial sementara
+    WiFi.mode(WIFI_OFF);    // Matikan radio WiFi
+    delay(500);             // Beri jeda agar listrik stabil
+
+    // 4. Restart System
+    ESP.restart(); 
+  });
+
+  server.begin();
+}
+
+// ==========================================
+// 2. SETUP
+// ==========================================
 
 void setup() {
   Serial.begin(115200);
-  
-  // 1. Init Pins
-  pinMode(BUTTON_PIN, INPUT_PULLUP); // Still needed for Reset
-  pinMode(IR_SENSOR_PIN, INPUT);     // IR Sensor Input
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(IR_SENSOR_PIN, INPUT);
 
-  // 2. Init Screen
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
-    Serial.println(F("Screen allocation failed"));
-    for(;;); 
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Cek 0x3C / 0x3D
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) for(;;);
   }
-  
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
 
-  // 3. SAFE RESET LOGIC (Hold BOOT button to reset WiFi)
-  // We keep this on the physical button because it's safer for maintenance
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("To Reset WiFi:");
-  display.println("Hold BOOT Button...");
-  display.drawRect(0, 40, 128, 10, SSD1306_WHITE);
+  if(!LittleFS.begin(true)){ Serial.println("FS Error"); }
+  loadCustomFace();
+
+  // STARTUP NORMAL
+  display.setCursor(0,20);
+  display.println("Connecting WiFi...");
   display.display();
 
-  bool forceSetup = false;
-  for (int i = 0; i < 128; i++) {
-    display.fillRect(0, 40, i, 10, SSD1306_WHITE);
-    display.display();
-    
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      forceSetup = true;
-      break; 
-    }
-    delay(20); 
-  }
-
-  // 4. WiFiManager Logic
+  // Coba connect WiFi Rumah (Timeout 5 detik biar cepet)
   WiFiManager wifiManager;
-  wifiManager.setAPCallback(configModeCallback);
-
-  if (forceSetup) {
-    display.clearDisplay();
-    display.setCursor(0, 10);
-    display.println("Button Detected!");
-    display.println("Forcing Setup...");
-    display.display();
-    delay(1000); 
-
-    if (!wifiManager.startConfigPortal("CatBot-AP", "catbotyasha")) {
-      ESP.restart();
-    }
-  } else {
-    display.clearDisplay();
-    display.setCursor(0, 10);
-    display.println("Connecting...");
-    display.display();
-    
-    if(!wifiManager.autoConnect("CatBot-AP", "catbotyasha")) {
-      Serial.println("Failed to connect");
-      ESP.restart(); 
-    }
+  wifiManager.setConnectTimeout(5); 
+  if(!wifiManager.autoConnect("CatBot-Setup")) {
+    // Kalau gagal wifi, lanjut aja (Mode Offline)
   }
 
-  // 5. Success
-  display.clearDisplay();
-  display.setCursor(0, 10);
-  display.println("WiFi Connected!");
-  display.println("Syncing Clock...");
-  display.display();
-  
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  
-  struct tm timeinfo;
-  if(getLocalTime(&timeinfo)){
-     display.println("Time OK!");
-  } else {
-     display.println("Time Error");
-  }
-  display.display();
-  delay(1000);
 }
+
+// ==========================================
+// 3. LOOP UTAMA
+// ==========================================
 
 void loop() {
-  handleInput(); // Check IR Sensor
+  // --- LOGIKA TOMBOL BOOT (TEKAN 3 DETIK) ---
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    if (buttonPressStart == 0) buttonPressStart = millis(); // Mulai hitung
+    
+    // Tampilkan Loading Bar di Layar
+    if (!isAdminMode) {
+      display.clearDisplay();
+      display.setCursor(0, 10); display.println("HOLD TO ADMIN...");
+      long duration = millis() - buttonPressStart;
+      int barWidth = map(duration, 0, 3000, 0, 128);
+      display.fillRect(0, 30, barWidth, 10, SSD1306_WHITE);
+      display.display();
+    }
 
-  if (currentMode == MODE_CAT) {
-    drawAnimatedFace();
+    // Jika sudah ditahan > 3 detik
+    if (millis() - buttonPressStart > 3000 && !isAdminMode) {
+      enterAdminMode();
+    }
   } else {
-    drawClock();
+    buttonPressStart = 0; // Reset jika tombol dilepas
   }
-  
-  delay(20); 
+
+  // --- CABANG MODE ---
+  if (isAdminMode) {
+    // JIKA MODE ADMIN
+    server.handleClient();
+    
+    // Tampilan Layar Admin
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.println("== ADMIN MODE ==");
+    display.println("");
+    display.println("WiFi: Neko-Admin");
+    display.println("Pass: 12345678");
+    display.println("IP:   192.168.4.1");
+    display.display();
+    delay(100); // Hemat CPU
+    
+  } else {
+    // JIKA MODE NORMAL (Kucing/Jam)
+    if (buttonPressStart == 0) { // Hanya update animasi jika tombol TIDAK ditekan
+      runNormalMode();
+    }
+  }
 }
 
-// --- NEW INPUT LOGIC (IR SENSOR) ---
-void handleInput() {
-  // Read the IR Sensor on Pin 19
-  int reading = digitalRead(IR_SENSOR_PIN);
+// ==========================================
+// 4. FUNGSI LOGIC NORMAL
+// ==========================================
+
+void runNormalMode() {
+  handleIrInput(); // Cek Sensor IR
+
+  if (currentMode == MODE_CAT) drawAnimatedFace();
+  else if (currentMode == MODE_CLOCK) drawClock();
+  else if (currentMode == MODE_CUSTOM) drawCustomImage();
   
-  // Logic: Most IR sensors go LOW when they see an object (Hand)
-  // We check if it IS Low (Object seen) AND it WAS High (Empty before)
-  // We add a longer delay (500ms) to prevent double-triggering while waving
+  delay(20);
+}
+
+void handleIrInput() {
+  int reading = digitalRead(IR_SENSOR_PIN);
   if (reading == LOW && lastIrState == HIGH && (millis() - lastInputTime > 500)) {
-      
-      // Toggle Mode
-      if (currentMode == MODE_CAT) {
-        currentMode = MODE_CLOCK;
-      } else {
-        currentMode = MODE_CAT;
-      }
-      
-      display.clearDisplay(); 
-      lastInputTime = millis();
+      if (currentMode == MODE_CAT) currentMode = MODE_CLOCK;
+      else if (currentMode == MODE_CLOCK) {
+        if (hasCustomFace) currentMode = MODE_CUSTOM;
+        else currentMode = MODE_CAT;
+      } else currentMode = MODE_CAT;
+      display.clearDisplay(); lastInputTime = millis();
   }
   lastIrState = reading;
 }
 
-// --- ANIMATION LOGIC ---
+void drawCustomImage() {
+  display.clearDisplay();
+  display.drawBitmap(0, 0, customFaceBuffer, 128, 64, SSD1306_WHITE);
+  display.display();
+}
+
+void drawClock() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    display.clearDisplay(); display.setCursor(0,0);
+    display.println("No Internet/Clock"); display.display(); return;
+  }
+  display.clearDisplay();
+  display.setTextSize(3); display.setCursor(20, 15);
+  display.printf("%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+  display.setTextSize(1); display.setCursor(30, 50);
+  display.printf("%02d/%02d/%04d", timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+  display.display();
+}
+
 void drawAnimatedFace() {
   unsigned long currentMillis = millis();
-
   if (currentMillis - lastBlinkTime >= blinkInterval) {
-    lastBlinkTime = currentMillis;
-    blinkInterval = random(2000, 6000); 
-
-    if (random(0, 100) < 20) { 
-      isWinking = true;
-      isBlinking = false;
-      winkSide = random(0, 2); 
-    } else {
-      isBlinking = true;
-      isWinking = false;
-    }
+    lastBlinkTime = currentMillis; blinkInterval = random(2000, 6000); 
+    if (random(0, 100) < 20) { isWinking = true; isBlinking = false; winkSide = random(0, 2); } 
+    else { isBlinking = true; isWinking = false; }
   }
-
-  if ((isBlinking || isWinking) && (currentMillis - lastBlinkTime > 200)) {
-    isBlinking = false;
-    isWinking = false;
-  }
-
+  if ((isBlinking || isWinking) && (currentMillis - lastBlinkTime > 200)) { isBlinking = false; isWinking = false; }
   display.clearDisplay();
-  
   if (random(0, 100) > 90) pupilOffset = random(-4, 5);
-
-  if (isBlinking || (isWinking && winkSide == 0)) {
-    drawClosedEye(40, 32); 
-  } else {
-    drawOpenEye(40, 32, pupilOffset); 
-  }
-
-  if (isBlinking || (isWinking && winkSide == 1)) {
-    drawClosedEye(88, 32);
-  } else {
-    drawOpenEye(88, 32, pupilOffset);
-  }
-
-  int mX = 64; 
-  int mY = 42;
+  if (isBlinking || (isWinking && winkSide == 0)) drawClosedEye(40, 32); else drawOpenEye(40, 32, pupilOffset); 
+  if (isBlinking || (isWinking && winkSide == 1)) drawClosedEye(88, 32); else drawOpenEye(88, 32, pupilOffset);
+  int mX = 64; int mY = 42;
   display.drawLine(mX - 12, mY, mX - 6, mY + 5, SSD1306_WHITE);
   display.drawLine(mX - 6, mY + 5, mX, mY, SSD1306_WHITE);
   display.drawLine(mX, mY, mX + 6, mY + 5, SSD1306_WHITE);
   display.drawLine(mX + 6, mY + 5, mX + 12, mY, SSD1306_WHITE);
-
   display.display();
 }
-
-// --- DRAWING HELPERS ---
 void drawOpenEye(int x, int y, int offset) {
-  display.fillCircle(x, y, 10, SSD1306_WHITE);
-  display.fillCircle(x + offset, y, 4, SSD1306_BLACK); 
-  display.drawPixel(x + offset - 1, y - 1, SSD1306_WHITE); 
+  display.fillCircle(x, y, 10, SSD1306_WHITE); display.fillCircle(x + offset, y, 4, SSD1306_BLACK); display.drawPixel(x + offset - 1, y - 1, SSD1306_WHITE); 
 }
-
 void drawClosedEye(int x, int y) {
-  display.drawCircle(x, y, 10, SSD1306_WHITE);
-  display.fillRect(x - 11, y - 12, 23, 13, SSD1306_BLACK);
-}
-
-// --- CLOCK DISPLAY ---
-void drawClock() {
-  struct tm timeinfo;
-  
-  if(!getLocalTime(&timeinfo)){
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(0,0);
-    display.println("Syncing Time...");
-    display.display();
-    return;
-  }
-
-  display.clearDisplay();
-  display.setTextSize(3);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(20, 15);
-  display.printf("%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
-  
-  display.setTextSize(1);
-  display.setCursor(30, 50);
-  display.printf("%02d/%02d/%04d", timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
-  
-  display.display();
+  display.drawCircle(x, y, 10, SSD1306_WHITE); display.fillRect(x - 11, y - 12, 23, 13, SSD1306_BLACK);
 }
