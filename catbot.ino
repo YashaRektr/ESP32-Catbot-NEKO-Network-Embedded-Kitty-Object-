@@ -1,11 +1,16 @@
 /*
- * 🐱 N.E.K.O. - EASY ADMIN VERSION
- * -------------------------------------------------------
- * Cara Pakai:
- * 1. Nyalakan alat seperti biasa (Mode Kucing/Jam).
- * 2. Ingin Upload Gambar? TAHAN tombol BOOT (di board) selama 3 detik.
- * 3. Alat akan berubah jadi Mode Admin (WiFi Hotspot).
- * 4. Connect Laptop ke WiFi "Neko-Admin", buka 192.168.4.1
+ * 🐱 N.E.K.O. (Network Embedded Kitty Object) - FINAL STABLE
+ * ----------------------------------------------------------
+ * Hardware:
+ * - ESP32 DevKit V1
+ * - OLED SSD1306 (SDA:21, SCL:22)
+ * - IR Sensor (GPIO 19)
+ * - Tombol Menu (GPIO 15) -> Sambung ke GND saat ditekan
+ * - Tombol BOOT (GPIO 0) -> Cadangan
+ * * Fitur:
+ * - Normal: Animasi Kucing, Jam (WIB), Custom Image.
+ * - Admin: Tekan tombol -> Hotspot "Neko-Admin" -> Buka 192.168.4.1
+ * - Web Menu: Upload Gambar & Reset WiFi.
  */
 
 #include <Wire.h>
@@ -16,38 +21,45 @@
 #include <LittleFS.h>
 #include <WebServer.h>
 
-// --- PIN ---
-#define IR_SENSOR_PIN 19  
-#define BUTTON_PIN 0      // Tombol BOOT
+// --- KONFIGURASI PIN ---
+#define IR_SENSOR_PIN   19  
+#define EXT_BUTTON_PIN  15  // Tombol Menu Eksternal
+#define BOOT_BUTTON_PIN 0   // Tombol Bawaan
 
 // --- LAYAR ---
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// --- SERVER & VARS ---
+// --- SERVER & VARIABLE ---
 WebServer server(80);
 bool hasCustomFace = false;
 uint8_t customFaceBuffer[1024];
+bool isAdminMode = false;       
 
-// Status System
-bool isAdminMode = false;       // False = Mode Kucing, True = Mode Upload
-unsigned long buttonPressStart = 0; // Untuk hitung durasi tekan tombol
-
-// Vars Animasi
+// --- ANIMASI & LOGIC ---
 enum AppMode { MODE_CAT, MODE_CLOCK, MODE_CUSTOM };
 AppMode currentMode = MODE_CAT; 
-int pupilOffset = 0; unsigned long lastBlinkTime = 0; int blinkInterval = 3000; 
-bool isBlinking = false; bool isWinking = false; int winkSide = 0;         
-int lastIrState = HIGH; unsigned long lastInputTime = 0;
 
-// Time
+// Variabel Mata
+int pupilOffset = 0; 
+unsigned long lastBlinkTime = 0; 
+int blinkInterval = 3000; 
+bool isBlinking = false; 
+bool isWinking = false; 
+int winkSide = 0;         
+
+// Variabel IR Sensor
+int lastIrState = HIGH; 
+unsigned long lastInputTime = 0;
+
+// Waktu (WIB / GMT+7)
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 25200; 
 const int   daylightOffset_sec = 0;
 
 // ==========================================
-// 1. FUNGSI ADMIN & FILE
+// 1. FUNGSI FILE SYSTEM
 // ==========================================
 
 void loadCustomFace() {
@@ -61,175 +73,205 @@ void loadCustomFace() {
   } else { hasCustomFace = false; }
 }
 
+// ==========================================
+// 2. MODE ADMIN (WEB SERVER)
+// ==========================================
+
 void enterAdminMode() {
-  isAdminMode = true;
+  isAdminMode = true; // Kunci Mode Admin
   
-  // Matikan WiFi Station & Nyalakan AP
+  // Tampilan Layar Info
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0,0);
+  display.println("== ADMIN MENU ==");
+  display.println("");
+  display.println("WiFi: Neko-Admin");
+  display.println("Pass: 12345678");
+  display.println("");
+  display.println("IP:   192.168.4.1");
+  display.display();
+
+  // Matikan Station, Nyalakan AP
   WiFi.disconnect(); 
   delay(100);
   WiFi.mode(WIFI_AP);
   WiFi.softAP("Neko-Admin", "12345678");
 
-  // --- HALAMAN UTAMA ---
+  // --- HALAMAN WEB ---
   server.on("/", HTTP_GET, [](){
-    String html = "<html><body style='background:#222;color:#0f0;text-align:center;font-family:monospace;'>";
-    html += "<h1>N.E.K.O ADMIN MODE</h1>";
-    html += "<div style='border:2px solid #0f0;padding:20px;'>";
-    html += "<h3>UPLOAD IMAGE (.bin)</h3>";
+    String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>body{background:#222;color:#0f0;font-family:monospace;text-align:center;padding:20px;}";
+    html += ".box{border:2px solid #0f0;padding:15px;margin-bottom:20px;border-radius:10px;}";
+    html += "button{width:100%;padding:12px;font-weight:bold;margin:5px 0;border:none;border-radius:5px;cursor:pointer;}";
+    html += ".btn-up{background:#0f0;color:#000;} .btn-reset{background:#f90;color:#000;} .btn-exit{background:#f00;color:#fff;}";
+    html += "</style></head><body>";
+    
+    html += "<h1>🐱 N.E.K.O. PANEL</h1>";
+    
+    // Upload Box
+    html += "<div class='box'><h3>1. GANTI WAJAH</h3>";
+    html += "<p>Upload file .bin (128x64)</p>";
     html += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
-    html += "<input type='file' name='upload' style='color:white;'><br><br>";
-    html += "<input type='submit' value='UPLOAD' style='background:#0f0;padding:10px;font-weight:bold;'>";
+    html += "<input type='file' name='upload' style='color:white;margin-bottom:10px;'><br>";
+    html += "<input type='submit' value='UPLOAD GAMBAR' class='btn-up'>";
     html += "</form></div>";
-    html += "<br><a href='/exit'><button style='padding:15px;background:red;color:white;'>KELUAR ADMIN MODE</button></a>";
+    
+    // Reset WiFi Box
+    html += "<div class='box'><h3>2. KONEKSI</h3>";
+    html += "<p>Ganti WiFi Rumah?</p>";
+    html += "<a href='/resetwifi' onclick=\"return confirm('Reset WiFi sekarang?')\">";
+    html += "<button class='btn-reset'>RESET WIFI SETTINGS</button></a></div>";
+
+    // Exit Button
+    html += "<br><a href='/exit'><button class='btn-exit'>KELUAR / RESTART</button></a>";
     html += "</body></html>";
     server.send(200, "text/html", html);
   });
 
-  // --- BAGIAN YANG DIPERBAIKI (FIX CORRUPTED ERROR) ---
+  // Handler Upload (Fixed for Firefox)
   server.on("/upload", HTTP_POST, 
-    // 1. Handler RESPON (Dijalankan SETELAH upload selesai)
-    [](){ 
-      server.send(200, "text/html", "<h2>UPLOAD SUKSES!</h2><p>Gambar tersimpan.</p><a href='/'>Kembali</a>"); 
-    }, 
-    // 2. Handler PROSES UPLOAD (Dijalankan SAAT data dikirim)
+    [](){ server.send(200, "text/html", "<h2>UPLOAD SUKSES!</h2><a href='/'>Kembali</a>"); }, 
     [](){
       HTTPUpload& upload = server.upload();
       if (upload.status == UPLOAD_FILE_START) {
-        // Hapus file lama, buat baru
-        LittleFS.remove("/face.bin"); 
-        File file = LittleFS.open("/face.bin", "w");
-        file.close();
+        LittleFS.remove("/face.bin"); File file = LittleFS.open("/face.bin", "w"); file.close();
       } else if (upload.status == UPLOAD_FILE_WRITE) {
-        // Tulis data chunk demi chunk
-        File file = LittleFS.open("/face.bin", "a");
-        if (file) file.write(upload.buf, upload.currentSize);
-        file.close();
-      } else if (upload.status == UPLOAD_FILE_END) {
-        // Saat selesai, reload gambar ke RAM
-        loadCustomFace();
-        // PENTING: JANGAN ada server.send() di sini! Biarkan Handler 1 yang kerjakan.
-      }
+        File file = LittleFS.open("/face.bin", "a"); if (file) file.write(upload.buf, upload.currentSize); file.close();
+      } else if (upload.status == UPLOAD_FILE_END) { loadCustomFace(); }
     }
   );
 
+  // Handler Reset WiFi
+  server.on("/resetwifi", HTTP_GET, [](){
+    server.send(200, "text/html", "<h2>WiFi Direset!</h2><p>Alat sedang restart...</p>");
+    display.clearDisplay(); display.setCursor(0,20); display.println("RESETTING WIFI..."); display.display();
+    WiFiManager wm; wm.resetSettings();
+    delay(2000); ESP.restart();
+  });
+
+  // Handler Exit (Clean Restart)
   server.on("/exit", HTTP_GET, [](){
-    // 1. Kirim pesan terakhir ke Browser
-    server.send(200, "text/html", "<h2 style='text-align:center;'>Restarting N.E.K.O...<br>Silakan tutup browser.</h2>");
+    server.send(200, "text/html", "<h2>Bye Bye!</h2>");
     delay(500);
-
-    // 2. Bersihkan Layar (Agar tidak terlihat stuck)
-    display.clearDisplay();
-    display.setCursor(0, 20);
-    display.println("REBOOTING...");
-    display.display();
-    delay(1000);
-
-    // 3. Matikan WiFi & Putus Koneksi Total (Penting!)
-    WiFi.disconnect(true);  // Hapus kredensial sementara
-    WiFi.mode(WIFI_OFF);    // Matikan radio WiFi
-    delay(500);             // Beri jeda agar listrik stabil
-
-    // 4. Restart System
-    ESP.restart(); 
+    display.clearDisplay(); display.setCursor(0,20); display.println("REBOOTING..."); display.display();
+    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+    delay(1000); ESP.restart(); 
   });
 
   server.begin();
 }
 
 // ==========================================
-// 2. SETUP
+// 3. SETUP
+// ==========================================
+
+// ==========================================
+// 3. SETUP (PERBAIKAN WIFI RESET)
 // ==========================================
 
 void setup() {
   Serial.begin(115200);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(EXT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   pinMode(IR_SENSOR_PIN, INPUT);
 
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Cek 0x3C / 0x3D
+  // Init Layar
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
     if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) for(;;);
   }
   display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
 
+  // Init File System
   if(!LittleFS.begin(true)){ Serial.println("FS Error"); }
   loadCustomFace();
 
-  // STARTUP NORMAL
+  // STARTUP
   display.setCursor(0,20);
-  display.println("Connecting WiFi...");
+  display.println("Starting...");
   display.display();
 
-  // Coba connect WiFi Rumah (Timeout 5 detik biar cepet)
+  // --- LOGIKA WIFI MANAGER BARU ---
   WiFiManager wifiManager;
-  wifiManager.setConnectTimeout(5); 
+  
+  // 1. Timeout Koneksi ke Router (Coba connect 10 detik)
+  wifiManager.setConnectTimeout(10); 
+  
+  // 2. Timeout Hotspot Setup (PENTING!)
+  // Ganti dari 1 menjadi 180 (3 Menit).
+  // Ini memberi kamu waktu 3 menit untuk connect ke "CatBot-Setup" setelah reset.
+  wifiManager.setConfigPortalTimeout(180); 
+
+  // Coba connect otomatis
+  // Jika gagal (atau habis direset), dia bikin Hotspot "CatBot-Setup"
   if(!wifiManager.autoConnect("CatBot-Setup")) {
-    // Kalau gagal wifi, lanjut aja (Mode Offline)
+    
+    // Jika setelah 3 menit (180s) kamu tidak connect juga, baru dia nyerah
+    display.clearDisplay(); display.setCursor(0,0);
+    display.println("WiFi Setup Timeout!"); 
+    display.println("Offline Mode"); 
+    display.display();
+    delay(2000);
+    
+  } else {
+    // Jika berhasil connect
+    display.clearDisplay(); display.setCursor(0,20);
+    display.println("WiFi Connected!"); 
+    display.display();
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   }
-
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 }
-
 // ==========================================
-// 3. LOOP UTAMA
+// 4. LOOP UTAMA (ANTI-HANG & ONE-SHOT)
 // ==========================================
 
 void loop() {
-  // --- LOGIKA TOMBOL BOOT (TEKAN 3 DETIK) ---
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    if (buttonPressStart == 0) buttonPressStart = millis(); // Mulai hitung
-    
-    // Tampilkan Loading Bar di Layar
-    if (!isAdminMode) {
-      display.clearDisplay();
-      display.setCursor(0, 10); display.println("HOLD TO ADMIN...");
-      long duration = millis() - buttonPressStart;
-      int barWidth = map(duration, 0, 3000, 0, 128);
-      display.fillRect(0, 30, barWidth, 10, SSD1306_WHITE);
-      display.display();
-    }
-
-    // Jika sudah ditahan > 3 detik
-    if (millis() - buttonPressStart > 3000 && !isAdminMode) {
-      enterAdminMode();
-    }
-  } else {
-    buttonPressStart = 0; // Reset jika tombol dilepas
-  }
-
-  // --- CABANG MODE ---
+  // 1. JIKA MODE ADMIN AKTIF -> Stop semua logika lain
   if (isAdminMode) {
-    // JIKA MODE ADMIN
     server.handleClient();
-    
-    // Tampilan Layar Admin
-    display.clearDisplay();
-    display.setCursor(0,0);
-    display.println("== ADMIN MODE ==");
-    display.println("");
-    display.println("WiFi: Neko-Admin");
-    display.println("Pass: 12345678");
-    display.println("IP:   192.168.4.1");
-    display.display();
-    delay(100); // Hemat CPU
-    
-  } else {
-    // JIKA MODE NORMAL (Kucing/Jam)
-    if (buttonPressStart == 0) { // Hanya update animasi jika tombol TIDAK ditekan
-      runNormalMode();
+    delay(10); 
+    return; // PENTING: Jangan lanjut ke bawah
+  }
+
+  // 2. CEK TOMBOL (Hanya jika belum Admin)
+  bool btnExt = (digitalRead(EXT_BUTTON_PIN) == LOW);
+  bool btnBoot = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+
+  if (btnExt || btnBoot) {
+    delay(50); // Debounce
+    // Cek lagi untuk memastikan
+    if (digitalRead(EXT_BUTTON_PIN) == LOW || digitalRead(BOOT_BUTTON_PIN) == LOW) {
+      
+      // Visual Feedback
+      display.clearDisplay();
+      display.setCursor(0, 20);
+      display.println("SWITCHING MODE...");
+      display.println("PLEASE WAIT");
+      display.display();
+      
+      // JALANKAN PERINTAH (Hanya Sekali!)
+      enterAdminMode(); 
+      
+      // Tunggu tombol dilepas (Biar gak restart looping)
+      while(digitalRead(EXT_BUTTON_PIN) == LOW || digitalRead(BOOT_BUTTON_PIN) == LOW) {
+        delay(100);
+      }
     }
   }
+
+  // 3. LOGIKA NORMAL (Hanya jalan jika tombol tidak ditekan)
+  runNormalMode();
 }
 
 // ==========================================
-// 4. FUNGSI LOGIC NORMAL
+// 5. ANIMASI & FUNGSI GAMBAR
 // ==========================================
 
 void runNormalMode() {
-  handleIrInput(); // Cek Sensor IR
-
+  handleIrInput(); 
   if (currentMode == MODE_CAT) drawAnimatedFace();
   else if (currentMode == MODE_CLOCK) drawClock();
   else if (currentMode == MODE_CUSTOM) drawCustomImage();
-  
   delay(20);
 }
 
@@ -238,8 +280,7 @@ void handleIrInput() {
   if (reading == LOW && lastIrState == HIGH && (millis() - lastInputTime > 500)) {
       if (currentMode == MODE_CAT) currentMode = MODE_CLOCK;
       else if (currentMode == MODE_CLOCK) {
-        if (hasCustomFace) currentMode = MODE_CUSTOM;
-        else currentMode = MODE_CAT;
+        if (hasCustomFace) currentMode = MODE_CUSTOM; else currentMode = MODE_CAT;
       } else currentMode = MODE_CAT;
       display.clearDisplay(); lastInputTime = millis();
   }
@@ -247,16 +288,14 @@ void handleIrInput() {
 }
 
 void drawCustomImage() {
-  display.clearDisplay();
-  display.drawBitmap(0, 0, customFaceBuffer, 128, 64, SSD1306_WHITE);
-  display.display();
+  display.clearDisplay(); display.drawBitmap(0, 0, customFaceBuffer, 128, 64, SSD1306_WHITE); display.display();
 }
 
 void drawClock() {
   struct tm timeinfo;
   if(!getLocalTime(&timeinfo)){
     display.clearDisplay(); display.setCursor(0,0);
-    display.println("No Internet/Clock"); display.display(); return;
+    display.println("No Internet"); display.println("Check WiFi"); display.display(); return;
   }
   display.clearDisplay();
   display.setTextSize(3); display.setCursor(20, 15);
@@ -266,18 +305,36 @@ void drawClock() {
   display.display();
 }
 
+// --- ANIMASI WAJAH (ANTI-STUCK / FAIL SAFE) ---
 void drawAnimatedFace() {
   unsigned long currentMillis = millis();
+
+  // Trigger Kedip
   if (currentMillis - lastBlinkTime >= blinkInterval) {
     lastBlinkTime = currentMillis; blinkInterval = random(2000, 6000); 
     if (random(0, 100) < 20) { isWinking = true; isBlinking = false; winkSide = random(0, 2); } 
     else { isBlinking = true; isWinking = false; }
   }
-  if ((isBlinking || isWinking) && (currentMillis - lastBlinkTime > 200)) { isBlinking = false; isWinking = false; }
+
+  // Reset Kedip (Fail Safe: Paksa melek jika > 500ms)
+  if ((isBlinking || isWinking) && (currentMillis - lastBlinkTime > 200)) { 
+    isBlinking = false; isWinking = false; 
+  }
+  if (currentMillis - lastBlinkTime > 500) { // Safety Extra
+     isBlinking = false; isWinking = false; 
+  }
+
   display.clearDisplay();
   if (random(0, 100) > 90) pupilOffset = random(-4, 5);
-  if (isBlinking || (isWinking && winkSide == 0)) drawClosedEye(40, 32); else drawOpenEye(40, 32, pupilOffset); 
-  if (isBlinking || (isWinking && winkSide == 1)) drawClosedEye(88, 32); else drawOpenEye(88, 32, pupilOffset);
+
+  // Gambar Mata
+  if (isBlinking || (isWinking && winkSide == 0)) drawClosedEye(40, 32); 
+  else drawOpenEye(40, 32, pupilOffset); 
+
+  if (isBlinking || (isWinking && winkSide == 1)) drawClosedEye(88, 32); 
+  else drawOpenEye(88, 32, pupilOffset);
+
+  // Gambar Mulut
   int mX = 64; int mY = 42;
   display.drawLine(mX - 12, mY, mX - 6, mY + 5, SSD1306_WHITE);
   display.drawLine(mX - 6, mY + 5, mX, mY, SSD1306_WHITE);
@@ -285,9 +342,14 @@ void drawAnimatedFace() {
   display.drawLine(mX + 6, mY + 5, mX + 12, mY, SSD1306_WHITE);
   display.display();
 }
+
 void drawOpenEye(int x, int y, int offset) {
-  display.fillCircle(x, y, 10, SSD1306_WHITE); display.fillCircle(x + offset, y, 4, SSD1306_BLACK); display.drawPixel(x + offset - 1, y - 1, SSD1306_WHITE); 
+  display.fillCircle(x, y, 10, SSD1306_WHITE); 
+  display.fillCircle(x + offset, y, 4, SSD1306_BLACK); 
+  display.drawPixel(x + offset - 1, y - 1, SSD1306_WHITE); 
 }
+
 void drawClosedEye(int x, int y) {
-  display.drawCircle(x, y, 10, SSD1306_WHITE); display.fillRect(x - 11, y - 12, 23, 13, SSD1306_BLACK);
+  display.drawCircle(x, y, 10, SSD1306_WHITE); 
+  display.fillRect(x - 11, y - 12, 23, 13, SSD1306_BLACK);
 }
